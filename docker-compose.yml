@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.16.0-community
+    container_name: prophet-neo4j
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-secret}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - prophet-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prophet:
+    build: .
+    container_name: prophet-app
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      - WAZUH_URL=${WAZUH_URL}
+      - WAZUH_USER=${WAZUH_USER}
+      - WAZUH_PASSWORD=${WAZUH_PASSWORD}
+      - WAZUH_VERIFY_SSL=${WAZUH_VERIFY_SSL:-True}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-secret}
+      - LOG_LEVEL=INFO
+    networks:
+      - prophet-net
+    restart: unless-stopped
+
+networks:
+  prophet-net:
+    driver: bridge
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
