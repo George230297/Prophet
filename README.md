@@ -11,7 +11,7 @@
 
 **Prophet** es una herramienta de ingeniería de seguridad diseñada para actuar como un puente inteligente (Middleware ETL) entre un SIEM (**Wazuh**) y una base de datos orientada a grafos (**Neo4j**).
 
-Su función principal es transformar alertas de seguridad planas y aisladas en un **grafo de conocimiento dinámico**, permitiendo a los analistas de seguridad visualizar y consultar relaciones complejas entre atacantes, activos, usuarios y eventos en tiempo real.
+Su función principal es transformar alertas de seguridad planas y aisladas en un **grafo de conocimiento dinámico**, permitiendo a los analistas de seguridad visualizar y consultar relaciones complejas entre atacantes, activos, usuarios y eventos en tiempo real, conectándolas de forma nativa con **Inteligencia de Amenazas (MITRE ATT&CK / STIX)**.
 
 ## 🎯 Objetivo
 
@@ -23,8 +23,10 @@ El problema de los SIEM tradicionales es que almacenan los datos de forma tabula
 **El objetivo de Prophet es revelar estas conexiones ocultas**, permitiendo:
 
 1.  **Correlación Avanzada**: Detectar movimientos laterales y patrones de ataque distribuidos.
-2.  **Análisis Forense Visual**: Seguir la traza de un atacante saltando entre nodos.
-3.  **Detección de Anomalías Relacionales**: Identificar comportamientos atípicos basados en la topología de la red.
+2.  **Enriquecimiento Dinámico**: Resolución automática en caché de dominios DNS y geolocalización de atacantes.
+3.  **Análisis Forense Visual**: Seguir la traza de un atacante saltando entre nodos.
+4.  **Detección de Anomalías Relacionales**: Identificar comportamientos atípicos basados en la topología de la red.
+5.  **Cálculo del Blast Radius**: Evaluar inmediatamente el "radio de explosión" o impacto derivado de la detección de una técnica de ATT&CK específica.
 
 ## 🏗️ Arquitectura e Implementación
 
@@ -39,7 +41,10 @@ Prophet está construido siguiendo principios de **Clean Architecture** y **DevS
 3.  **Carga (Load)**:
     - Proyecta las entidades en **Neo4j** utilizando transacciones ACID.
     - Uso de **Singleton Pattern** para `Neo4jConnector`, asegurando una gestión eficiente de conexiones.
-    - Usa operaciones `MERGE` (Idempotencia) para evitar duplicados.
+    - Implementación del **Repository Pattern** (`Neo4jAlertRepository`) para ingestas masivas.
+    - Ingestión escalable en lote (_Batch Insert_) empleando comandos `UNWIND` de Cypher, que procesa cientos de alertas simultáneamente sin bloquear la DB.
+    - Mapeo dinámico hacia el modelo **STIX/TAXII** (Tácticas, Técnicas, Mitigaciones).
+    - Resolución y enriquecimiento de red **(DNS y GeoIP)** al vuelo.
 
 ### 🧩 Patrones de Diseño y Mejoras
 
@@ -57,7 +62,89 @@ Se han integrado patrones de diseño robustos para garantizar escalabilidad, ren
     - Implementado en `GraphService`.
     - **Beneficio**: Facilita el testing unitario al permitir inyectar mocks de la base de datos.
 
-### 📐 Diagrama de Arquitectura y Patrones (UML)
+### 📐 Arquitectura, Diseño y Patrones (UML)
+
+Para comprender en profundidad cómo Prophet interactúa con su entorno, el flujo de datos interno y los patrones de diseño aplicados, a continuación se presentan los diagramas UML que modelan el sistema.
+
+#### 1. Diagrama de Componentes (Arquitectura General)
+
+Este diagrama ilustra la arquitectura de alto nivel de **Prophet**, mostrando cómo se sitúa como Middleware ETL entre Wazuh (origen de datos) y Neo4j (destino y motor de análisis).
+
+```mermaid
+graph TD
+    %% Entidades Externas
+    Wazuh[("🛡️ Wazuh SIEM\n(API REST)")]
+    Neo4j[("🕸️ Neo4j\n(Graph Database)")]
+    Analyst(("👨‍💻 Analista de Seguridad"))
+
+    %% Prophet Core
+    subgraph Prophet ["⚡ Prophet Middleware"]
+        ETL["🔄 ETL Pipeline (main.py)"]
+        WazuhClient["🔌 WazuhClient\n(Async/HTTP)"]
+        Transformer["🧩 Data Normalizer\n(Pydantic)"]
+        Neo4jClient["🔌 Neo4jClient\n(Cypher)"]
+        Analyzer["🕵️‍♂️ AnalysisService\n(Detección)"]
+    end
+
+    %% Flujos
+    WazuhClient -- "Extracción\n(Polling JWT)" --> Wazuh
+    ETL -- "1. Coordina" --> WazuhClient
+    WazuhClient -. "Eventos JSON" .-> ETL
+
+    ETL -- "2. Transforma" --> Transformer
+    Transformer -. "Entidades Validadas" .-> ETL
+
+    ETL -- "3. Carga" --> Neo4jClient
+    Neo4jClient -- "MERGE Cypher\n(Transacciones ACID)" --> Neo4j
+
+    %% Flujo de Analista
+    Analyst -- "Ejecuta CLI\n(--analyze)" --> Analyzer
+    Analyzer -- "Queries Complejas\n(ShortestPath)" --> Neo4j
+    Analyzer -. "Alertas de Mov. Lateral\n/ IP Hopping" .-> Analyst
+```
+
+#### 2. Diagrama de Secuencia (Flujo de Ejecución Continuo)
+
+Muestra el paso a paso del proceso ETL principal y cómo interactúan las distintas capas informáticas en tiempo de ejecución.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Main as Main Loop
+    participant WClient as WazuhClient
+    participant Wazuh as Wazuh API
+    participant Model as Pydantic Models
+    participant NClient as Neo4jClient
+    participant DB as Neo4j DB
+
+    loop Cada X Segundos (Polling)
+        Main->>WClient: get_alerts(limit=50)
+        WClient->>Wazuh: GET /security/alerts (con JWT)
+        Wazuh-->>WClient: Response JSON
+        WClient-->>Main: List[Dict/JSON]
+
+        opt Si hay alertas nuevas
+            loop Por cada alerta
+                Main->>Model: Instanciar WazuhAlert(**raw_data)
+                Note over Model: Sanitización y validación estricta de tipos
+                Model-->>Main: Objeto Validado
+
+                Main->>Model: to_entity()
+                Model-->>Main: Entity (Nodo y Relaciones)
+
+                Main->>NClient: ingest_alert(Entity)
+                NClient->>DB: Ejecutar Cypher (MERGE)
+                DB-->>NClient: Confirmación (Idempotente)
+                NClient-->>Main: OK
+            end
+        end
+        Main->>Main: time.sleep(interval)
+    end
+```
+
+#### 3. Diagrama de Clases (Patrones de Diseño)
+
+Modelado de los principales patrones de diseño orientados a objetos utilizados en el núcleo de la aplicación (Singleton, Factory y Dependency Injection) para garantizar robustez y un código limpio.
 
 ```mermaid
 classDiagram
@@ -74,8 +161,8 @@ classDiagram
 
     %% Dependency Injection
     class Neo4jClient {
-        -connector
-        +ingest_alert()
+        -connector: Neo4jConnector
+        +ingest_alert(entity)
     }
     Neo4jConnector --* Neo4jClient : Inyectado/Usado
 
@@ -116,14 +203,19 @@ Recientemente se ha sometido el proyecto a una auditoría y refactorización pro
   - Lógica de los parsers de inteligencia de amenazas.
 - ✅ **Inyección de Dependencias**: Refactorización de servicios clave para desacoplarlos de la infraestructura concreta, facilitando el mantenimiento y las pruebas.
 
-### Modelo de Grafo
+### Modelo de Grafo (MITRE ATT&CK & STIX Entrelazado)
 
-Prophet modela la realidad usando el siguiente esquema:
+Prophet modela la realidad usando el siguiente esquema enriquecido con ciberinteligencia:
 
 - `(:IP address)` ➡️ `[:INITIATED]` ➡️ `(:Event)`
 - `(:User username)` ➡️ `[:TRIGGERED]` ➡️ `(:Event)`
 - `(:Event)` ➡️ `[:TARGETED]` ➡️ `(:IP address)`
 - `(:Event)` ➡️ `[:OCCURRED_ON]` ➡️ `(:Host hostname)`
+- `(:Event)` ➡️ `[:INDICATES]` ➡️ `(:Technique technique_id)`
+- `(:Event)` ➡️ `[:INDICATES]` ➡️ `(:Tactic name)`
+- `(:IP address)` ➡️ `[:RESOLVES_TO]` ➡️ `(:Domain name)`
+- `(:IP address)` ➡️ `[:LOCATED_IN]` ➡️ `(:Location country_name)`
+- `(:Mitigation mitigation_id)` ➡️ `[:MITIGATES]` ➡️ `(:Technique technique_id)`
 
 ### 🕵️‍♂️ Análisis y Detección de Amenazas
 
@@ -142,6 +234,15 @@ Detecta cuando un usuario comprometido salta entre hosts en un periodo corto de 
 Identifica IPs que inician ataques utilizando múltiples saltos intermedios.
 
 - **Patrón**: `IP A -> Evento -> IP B`
+
+#### 3. Cálculo de Impacto (Blast Radius)
+
+Mapea la diseminación de una táctica atacante.
+
+- **Patrón**: `Technique <- Evento -> Host/User`
+- **Uso Crítico**: Al saltar una alerta crítica de Wazuh, esta proyección extrae todos los recursos de red y usuarios bajo fuego por esa misma Táctica mitigando rápidamente su expansión.
+
+> 📚 **Cyber Playbooks (Cypher)**: Para ver ejemplos avanzados de cómo consultar la Inteligencia de Amenazas y el _Blast Radius_ utilizando Neo4j, consulta nuestro manual de playbooks: [docs/cypher_examples.md](docs/cypher_examples.md).
 
 ## Instalación y Uso
 

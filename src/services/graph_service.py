@@ -12,9 +12,9 @@ if not logger.handlers:
 
 from src.core.database import Neo4jConnector
 
-class Neo4jClient:
+class Neo4jAlertRepository:
     def __init__(self, connector: Optional[Neo4jConnector] = None):
-        """Initialize client. Supports dependency injection for testing."""
+        """Initialize repository. Supports dependency injection for testing."""
         self.connector = connector if connector else Neo4jConnector()
 
     @property
@@ -32,55 +32,114 @@ class Neo4jClient:
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
-    def ingest_alert(self, alert: ProphetEntity):
+    def ingest_batch(self, alerts: list[ProphetEntity]):
         """
-        Ingest a ProphetEntity into the graph.
-        Uses idempotent MERGE operations.
+        Ingest a batch of ProphetEntity into the graph.
+        Uses UNWIND for high-performance and scalable MERGE operations.
+        Ensures mapping to MITRE ATT&CK schema.
         """
+        if not alerts:
+            return
+
         query = """
-        MERGE (e:Event {
-            timestamp: $timestamp, 
-            hostname: $hostname, 
-            type: $event_type
-        })
+        UNWIND $batch AS alert
         
-        MERGE (h:Host {hostname: $hostname})
+        // 1. Merge core Event and Host
+        MERGE (e:Event {id: alert.id})
+        SET e.timestamp = alert.timestamp, e.type = alert.event_type
+        
+        MERGE (h:Host {hostname: alert.hostname})
         MERGE (e)-[:OCCURRED_ON]->(h)
         
-        FOREACH (ignoreMe IN CASE WHEN $user IS NOT NULL THEN [1] ELSE [] END |
-            MERGE (u:User {username: $user})
+        // 2. Merge User if present
+        FOREACH (ignoreMe IN CASE WHEN alert.user IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (u:User {username: alert.user})
             MERGE (u)-[:TRIGGERED]->(e)
         )
         
-        FOREACH (ignoreMe IN CASE WHEN $source_ip IS NOT NULL THEN [1] ELSE [] END |
-            MERGE (src:IP {address: $source_ip})
+        // 3. Merge Source IP if present
+        FOREACH (ignoreMe IN CASE WHEN alert.source_ip IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (src:IP {address: alert.source_ip})
             MERGE (src)-[:INITIATED]->(e)
         )
         
-        FOREACH (ignoreMe IN CASE WHEN $target_ip IS NOT NULL THEN [1] ELSE [] END |
-            MERGE (dst:IP {address: $target_ip})
+        // 4. Merge Target IP if present
+        FOREACH (ignoreMe IN CASE WHEN alert.target_ip IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (dst:IP {address: alert.target_ip})
             MERGE (e)-[:TARGETED]->(dst)
+        )
+        
+        // 5. Merge MITRE Techniques (STIX pattern)
+        FOREACH (tech_id IN alert.mitre_techniques |
+            MERGE (t:Technique {technique_id: tech_id})
+            MERGE (e)-[:INDICATES]->(t)
+        )
+        
+        // 6. Merge MITRE Tactics (STIX pattern)
+        FOREACH (tactic_name IN alert.mitre_tactics |
+            MERGE (ta:Tactic {name: tactic_name})
+            MERGE (e)-[:INDICATES]->(ta)
+        )
+        
+        // 7. Merge DNS Domain
+        FOREACH (ignoreMe IN CASE WHEN alert.dns_domain IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (d:Domain {name: alert.dns_domain})
+            // Solo conectamos si tenemos Target IP (destino del DNS)
+            MERGE (dst:IP {address: alert.target_ip})
+            MERGE (dst)-[:RESOLVES_TO]->(d)
+        )
+        
+        // 8. Merge Location
+        FOREACH (ignoreMe IN CASE WHEN alert.location_country IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (loc:Location {country_name: alert.location_country})
+            SET loc.city_name = alert.location_city
+            
+            // Conectamos la IP que inició el evento a esta geolocalización
+            MERGE (src:IP {address: alert.source_ip})
+            MERGE (src)-[:LOCATED_IN]->(loc)
+        )
+
+        // 9. Merge Mitigations (STIX pattern)
+        FOREACH (mitigation IN alert.mitre_mitigations |
+            MERGE (m:Mitigation {mitigation_id: mitigation.mitigation_id})
+            SET m.description = mitigation.description
+            
+            // Conectar la mitigación con las técnicas de la misma alerta
+            FOREACH (tech_id IN alert.mitre_techniques |
+                MERGE (t:Technique {technique_id: tech_id})
+                MERGE (m)-[:MITIGATES]->(t)
+            )
         )
         """
         
-        # Prepare parameters (Convert standard types if needed)
-        params = {
-            "timestamp": alert.timestamp.isoformat(),
-            "hostname": alert.hostname,
-            "event_type": alert.event_type,
-            "user": alert.user,
-            "source_ip": str(alert.source_ip) if alert.source_ip else None,
-            "target_ip": str(alert.target_ip) if alert.target_ip else None
-        }
+        # Prepare parameters for the UNWIND batch
+        batch_params = []
+        for alert in alerts:
+            batch_params.append({
+                "id": alert.id,
+                "timestamp": alert.timestamp.isoformat(),
+                "hostname": alert.hostname,
+                "event_type": alert.event_type,
+                "user": alert.user,
+                "source_ip": str(alert.source_ip) if alert.source_ip else None,
+                "target_ip": str(alert.target_ip) if alert.target_ip else None,
+                "dns_domain": alert.dns_domain,
+                "location_country": alert.location_country,
+                "location_city": alert.location_city,
+                "mitre_techniques": alert.mitre_techniques,
+                "mitre_tactics": alert.mitre_tactics,
+                "mitre_mitigations": alert.mitre_mitigations
+            })
 
-        self._execute_with_retry(query, params)
+        self._execute_with_retry(query, {"batch": batch_params})
 
     def _execute_with_retry(self, query: str, params: dict, max_retries: int = 3):
         """Executes a write transaction with exponential backoff for transient errors."""
         for attempt in range(max_retries):
             try:
                 if not self._driver:
-                    self._connect()
+                    # Fix: Rely on connector, error if not present
+                    raise RuntimeError("No Neo4j driver available from connector.")
                 
                 with self._driver.session() as session:
                     session.execute_write(lambda tx: tx.run(query, **params))
