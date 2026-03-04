@@ -48,19 +48,24 @@ Prophet está construido siguiendo principios de **Clean Architecture** y **DevS
 
 ### 🧩 Patrones de Diseño y Mejoras
 
-Se han integrado patrones de diseño robustos para garantizar escalabilidad, rendimiento y mantenibilidad:
+Se han integrado patrones de diseño robustos para garantizar escalabilidad, rendimiento y mantenibilidad técnica, especialmente tras la integración de MITRE ATT&CK:
 
 1.  **Singleton (Base de Datos)**:
     - Implementado en `Neo4jConnector` (Thread-Safe).
-    - **Beneficio**: Asegura una única instancia de conexión global, optimizando el uso de recursos y previniendo la saturación del pool de conexiones hacia Neo4j.
+    - **Beneficio**: Asegura una única instancia de conexión global, previniendo la saturación del pool de conexiones de Neo4j al aislar el Driver.
 
-2.  **Factory Method (Threat Intelligence)**:
+2.  **Repository Pattern (Ingesta Escalable)**:
+    - Implementado en `Neo4jAlertRepository`.
+    - **Beneficio**: Desacopla la lógica de negocio técnica de Neo4j del flujo general. Su implementación actual recibe lotes (_batches_) de entidades y usa la capacidad `UNWIND` de Cypher para realizar **inserciones masivas atómicas**.
+    - **Por qué se eligió**: Wazuh genera picos masivos de alertas de seguridad. Inyectar eventos uno a uno (One-by-One MERGE) podría bloquear la BD de red. Agrupar la ingesta en el Repositorio neutraliza este cuello de botella y asegura compatibilidad con un hipotético cambio de motor gráfico futuro.
+
+3.  **Factory Method (Threat Intelligence)**:
     - Implementado en `ThreatFeedFactory`.
-    - **Beneficio**: Permite la incorporación transparente de nuevas fuentes de amenazas (feeds) sin modificar el código cliente.
+    - **Beneficio**: Permite conectar fuentes externas de amenazas sin modificar los analizadores base.
 
-3.  **Dependency Injection (Servicios)**:
-    - Implementado en `GraphService`.
-    - **Beneficio**: Facilita el testing unitario al permitir inyectar mocks de la base de datos.
+4.  **Dependency Injection (Servicios)**:
+    - Implementado de forma nativa en constructores (ej. inyectando conectores en los repositorios).
+    - **Beneficio**: Alta modularidad para Test Driven Development (TDD) simulando bases de datos.
 
 ### 📐 Arquitectura, Diseño y Patrones (UML)
 
@@ -216,6 +221,65 @@ Prophet modela la realidad usando el siguiente esquema enriquecido con ciberinte
 - `(:IP address)` ➡️ `[:RESOLVES_TO]` ➡️ `(:Domain name)`
 - `(:IP address)` ➡️ `[:LOCATED_IN]` ➡️ `(:Location country_name)`
 - `(:Mitigation mitigation_id)` ➡️ `[:MITIGATES]` ➡️ `(:Technique technique_id)`
+
+#### Diagrama de Clases / Nodos (STIX Property Graph)
+
+A continuación se detalla visualmente la topología ontológica que hemos diseñado para Prophet. Esta arquitectura sigue los principios del **patrón STIX** (Structured Threat Information Expression) para representar Ciberinteligencia.
+
+```mermaid
+classDiagram
+    %% Core Entities
+    class Event {
+        string id
+        datetime timestamp
+        string type
+    }
+    class Host {
+        string hostname
+    }
+    class User {
+        string username
+    }
+
+    %% Network Infrastructure
+    class IP {
+        string address
+    }
+    class Domain {
+        string name
+    }
+    class Location {
+        string country_name
+        string city_name
+    }
+
+    %% MITRE ATT&CK & STIX
+    class Tactic {
+        string name
+    }
+    class Technique {
+        string technique_id
+    }
+    class Mitigation {
+        string mitigation_id
+        string description
+    }
+
+    %% Relationships
+    Event "1" --> "1" Host : OCCURRED_ON
+    User "1" --> "N" Event : TRIGGERED
+    IP "1" --> "N" Event : INITIATED
+    Event "1" --> "N" IP : TARGETED
+
+    IP "N" --> "1" Domain : RESOLVES_TO
+    IP "N" --> "1" Location : LOCATED_IN
+
+    Event "N" --> "N" Technique : INDICATES
+    Event "N" --> "N" Tactic : INDICATES
+    Mitigation "N" --> "N" Technique : MITIGATES
+```
+
+**Por qué este diseño ontológico:** La decisión de desacoplar los atributos en Nodos independientes (ej. convertir el `country` de una alerta en un Nodo `:Location` en lugar de una simple propiedad de `:Event`) promueve el rastreo de conexiones ocultas. Permite resolver rápidamente cuestiones forenses de alta dimensionalidad (ej. _¿qué eventos aislados están conectados al mismo País Atacante usando la misma Táctica?_).
 
 ### 🕵️‍♂️ Análisis y Detección de Amenazas
 
