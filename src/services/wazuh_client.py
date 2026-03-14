@@ -1,5 +1,4 @@
 import requests
-import base64
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging

@@ -30,6 +30,7 @@ def test_wazuh_alert_normalization():
 def test_prophet_entity_sanitization():
     """Test input sanitization for ProphetEntity."""
     entity = ProphetEntity(
+        id="test-sanitize-01",
         event_type="test_event",
         timestamp=datetime.now(),
         hostname="malicious<script>host",

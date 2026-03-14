@@ -1,4 +1,3 @@
-
 import pytest
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
@@ -69,3 +68,24 @@ def test_detect_suspicious_ip_chains(mock_connector):
     assert len(chain.nodes) == 3
     assert chain.nodes[0].label == "IP"
     assert chain.nodes[0].properties["address"] == "192.168.1.10"
+
+def test_detect_lateral_movement_returns_empty_when_no_records(mock_connector):
+    """Ensure empty list is returned when DB has no matching records."""
+    connector, session = mock_connector
+    service = AnalysisService(connector=connector)
+    session.run.return_value = []
+
+    results = service.detect_lateral_movement()
+
+    assert results == []
+
+def test_detect_suspicious_ip_chains_returns_empty_on_db_error(mock_connector):
+    """Ensure exception from DB is caught and empty list is returned (no crash)."""
+    connector, session = mock_connector
+    service = AnalysisService(connector=connector)
+    session.run.side_effect = Exception("Neo4j unavailable")
+
+    results = service.detect_suspicious_ip_chains()
+
+    assert results == []
+

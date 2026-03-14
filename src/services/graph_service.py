@@ -1,16 +1,12 @@
-from neo4j import GraphDatabase, Driver, basic_auth
-from src.config.settings import settings
+from neo4j import Driver
 from src.models.wazuh import ProphetEntity
 import logging
 import time
 from typing import Optional
 
-# Setup basic logger
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=settings.log_level)
-
 from src.core.database import Neo4jConnector
+
+logger = logging.getLogger(__name__)
 
 class Neo4jAlertRepository:
     def __init__(self, connector: Optional[Neo4jConnector] = None):
@@ -81,10 +77,9 @@ class Neo4jAlertRepository:
             MERGE (e)-[:INDICATES]->(ta)
         )
         
-        // 7. Merge DNS Domain
-        FOREACH (ignoreMe IN CASE WHEN alert.dns_domain IS NOT NULL THEN [1] ELSE [] END |
+        // 7. Merge DNS Domain (only when both dns_domain AND target_ip are present)
+        FOREACH (ignoreMe IN CASE WHEN alert.dns_domain IS NOT NULL AND alert.target_ip IS NOT NULL THEN [1] ELSE [] END |
             MERGE (d:Domain {name: alert.dns_domain})
-            // Solo conectamos si tenemos Target IP (destino del DNS)
             MERGE (dst:IP {address: alert.target_ip})
             MERGE (dst)-[:RESOLVES_TO]->(d)
         )
@@ -151,3 +146,11 @@ class Neo4jAlertRepository:
                     logger.error("Max retries reached. Transaction failed.")
                     raise e
                 time.sleep(wait_time)
+
+    def ingest_alert(self, alert: ProphetEntity):
+        """Convenience method to ingest a single ProphetEntity (delegates to ingest_batch)."""
+        self.ingest_batch([alert])
+
+
+# Backwards-compatibility alias — main.py imports Neo4jClient
+Neo4jClient = Neo4jAlertRepository
